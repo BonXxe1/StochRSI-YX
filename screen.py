@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-沪深主板 StochRSI 筛选（通达信口径）+ 飞书推送
+沪深主板 StochRSI 筛选（通达信口径）+ 去 ST + 飞书推送
 
 参数：N=15, M=8, P1=10, P2=3
 筛选：K < 10
+范围：沪深主板（含原中小板），不含创业板/科创板/北交所，不含 ST
 数据：新浪前复权
 """
 
@@ -95,7 +96,14 @@ def stochrsi(closes):
 
 
 def is_main_board(code: str) -> bool:
+    """沪深主板（含原中小板），不含创业板/科创板/北交所"""
     return code.startswith(("600", "601", "603", "605", "000", "001", "002", "003"))
+
+
+def is_st(name: str) -> bool:
+    """名称含 ST 的都剔除（ST / *ST / S*ST / SST 等）"""
+    n = (name or "").upper().replace(" ", "")
+    return "ST" in n
 
 
 def fetch_node(node: str):
@@ -190,12 +198,12 @@ def push_feishu(hits, summary):
     if not hits:
         text = (
             f"【StochRSI】{date} 收盘筛选完成\n"
-            f"主板计算 {summary.get('computed')} 只，K < 10：0 只\n"
+            f"主板（去ST）计算 {summary.get('computed')} 只，K < 10：0 只\n"
             f"K 中位数 {summary.get('k_p50')}，最高 {summary.get('k_max')}"
         )
     else:
         lines = [
-            f"【StochRSI】{date} 收盘筛选 · K < 10 共 {len(hits)} 只",
+            f"【StochRSI】{date} 收盘筛选 · 主板去ST · K < 10 共 {len(hits)} 只",
             "",
         ]
         for h in hits:
@@ -244,20 +252,28 @@ def main():
     print(f"sh_a {len(sh)} sz_a {len(sz)}", flush=True)
 
     universe = {}
+    st_skipped = 0
     for row in sh + sz:
         code = str(row.get("code") or "").zfill(6)
         if not is_main_board(code):
             continue
+        name = (row.get("name") or "").replace(" ", "")
+        if is_st(name):
+            st_skipped += 1
+            continue
         symbol = row.get("symbol") or (("sh" if code.startswith("6") else "sz") + code)
         universe[symbol] = {
             "code": code,
-            "name": (row.get("name") or "").replace(" ", ""),
+            "name": name,
         }
     symbols = sorted(universe)
     sh_n = sum(1 for s in symbols if universe[s]["code"].startswith("6"))
     sz_n = len(symbols) - sh_n
-    print(f"main {len(symbols)} sh {sh_n} sz {sz_n}", flush=True)
-    if sh_n < 1600 or sz_n < 1400:
+    print(
+        f"main(no ST) {len(symbols)} sh {sh_n} sz {sz_n}  skipped_ST {st_skipped}",
+        flush=True,
+    )
+    if sh_n < 1500 or sz_n < 1300:
         raise SystemExit(f"股票列表不完整 sh={sh_n} sz={sz_n}")
 
     series = {}
@@ -362,6 +378,7 @@ def main():
         "computed": int(arr.size),
         "errors": len(errors),
         "error_sample": list(errors.items())[:8],
+        "st_skipped": st_skipped,
         "below_10": len(hits),
         "below_20": int((arr < 20).sum()),
         "above_80": int((arr > 80).sum()),
@@ -384,7 +401,6 @@ def main():
     with open(OUT_JSON, "w", encoding="utf-8") as f:
         json.dump({"summary": summary, "hits": hits}, f, ensure_ascii=False, indent=2)
 
-    # 推送到飞书
     push_feishu(hits, summary)
 
     write_status("ok")
