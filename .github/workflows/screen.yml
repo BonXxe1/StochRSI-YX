@@ -1,0 +1,71 @@
+name: after-close-screen
+
+on:
+  schedule:
+    # 周一到周五 16:10（北京时间）。避开整点，等 15:00 收盘后的日K落定。
+    - cron: "10 16 * * 1-5"
+      timezone: Asia/Shanghai
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Screen
+        run: python screen.py
+
+      - name: Job summary
+        id: report
+        if: always()
+        run: |
+          state="$(tr -d '\r\n' < out/status.txt 2>/dev/null || true)"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          if [ "$state" != "ok" ]; then
+            echo "本次未更新结果（非交易日、行情未更新，或任务失败）。" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## 主板 StochRSI K < 10"
+            echo
+            echo '```'
+            cat out/latest.csv
+            echo '```'
+            echo
+            echo '```'
+            cat out/summary.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload CSV
+        if: always() && steps.report.outputs.state == 'ok'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stochrsi-${{ github.run_number }}
+          path: |
+            out/latest.csv
+            out/summary.json
+          if-no-files-found: warn
+
+      - name: Commit latest result
+        if: always() && steps.report.outputs.state == 'ok'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add out/latest.csv out/summary.json
+          git diff --cached --quiet && exit 0
+          git commit -m "screen: $(TZ=Asia/Shanghai date +%F)"
+          git push
