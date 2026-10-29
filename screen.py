@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""沪深主板 StochRSI 筛选。通达信公式，前复权。
-
-N=15  M=8  P1=10  P2=3
-K = SMA(STOCHRSI_RAW, P1, 1)
-D = SMA(K, P2, 1)
-通达信 SMA(X,N,1) = (X + (N-1)*昨日) / N
-输出 K < 10 的股票。非交易日直接退出，不覆盖上次结果。
 """
+沪深主板 StochRSI 筛选（通达信口径）+ 飞书推送
+
+参数：N=15, M=8, P1=10, P2=3
+筛选：K < 10
+数据：新浪前复权
+"""
+
 import json
 import os
 import re
@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
+# ============ 参数 ============
 N, M, P1, P2 = 15, 8, 10, 3
 THRESHOLD = 10.0
 KEEP = 220
@@ -26,24 +27,29 @@ WORKERS = 12
 OUT_CSV = "out/latest.csv"
 OUT_JSON = "out/summary.json"
 OUT_STATUS = "out/status.txt"
-UA = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"}
+
+UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://finance.sina.com.cn",
+}
 PAT = re.compile(r"_(\d{4})_(\d{2})_(\d{2}):\"([0-9.]+)\"")
 SH_TZ = ZoneInfo("Asia/Shanghai")
 
 
-def write_status(state):
+def write_status(state: str) -> None:
     os.makedirs("out", exist_ok=True)
     with open(OUT_STATUS, "w", encoding="utf-8") as f:
         f.write(state + "\n")
 
 
-def http_get(url, timeout=18):
+def http_get(url: str, timeout: int = 18) -> bytes:
     req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
 
 def tdx_sma(x, n, m):
+    """通达信 SMA(X,N,M) = (M*X + (N-M)*昨日) / N"""
     x = np.asarray(x, dtype=float)
     out = np.full(x.shape, np.nan)
     prev = None
@@ -67,6 +73,7 @@ def stochrsi(closes):
     with np.errstate(divide="ignore", invalid="ignore"):
         rsi = sma_up / sma_ab * 100.0
     rsi[(sma_ab == 0) | np.isnan(sma_ab)] = np.nan
+
     high = np.full(len(closes), np.nan)
     low = np.full(len(closes), np.nan)
     if len(closes) >= M:
@@ -74,6 +81,7 @@ def stochrsi(closes):
         mask = ~np.isnan(window).any(axis=1)
         high[M - 1 :][mask] = window[mask].max(axis=1)
         low[M - 1 :][mask] = window[mask].min(axis=1)
+
     raw = np.full(len(closes), np.nan)
     denom = high - low
     valid = ~np.isnan(denom) & ~np.isnan(rsi)
@@ -86,11 +94,11 @@ def stochrsi(closes):
     return k, d, rsi
 
 
-def is_main_board(code):
+def is_main_board(code: str) -> bool:
     return code.startswith(("600", "601", "603", "605", "000", "001", "002", "003"))
 
 
-def fetch_node(node):
+def fetch_node(node: str):
     stocks = []
     page = 1
     empty_tries = 0
@@ -124,7 +132,7 @@ def fetch_node(node):
     return stocks
 
 
-def fetch_qfq(symbol):
+def fetch_qfq(symbol: str):
     url = f"https://finance.sina.com.cn/realstock/company/{symbol}/qianfuquan.js"
     last = None
     for attempt in range(3):
@@ -171,6 +179,58 @@ def fetch_quotes(symbols):
     return out
 
 
+def push_feishu(hits, summary):
+    """推送到飞书自定义机器人"""
+    webhook = os.environ.get("FEISHU_WEBHOOK", "").strip()
+    if not webhook:
+        print("未配置 FEISHU_WEBHOOK，跳过飞书推送", flush=True)
+        return
+
+    date = summary.get("date", "")
+    if not hits:
+        text = (
+            f"【StochRSI】{date} 收盘筛选完成\n"
+            f"主板计算 {summary.get('computed')} 只，K < 10：0 只\n"
+            f"K 中位数 {summary.get('k_p50')}，最高 {summary.get('k_max')}"
+        )
+    else:
+        lines = [
+            f"【StochRSI】{date} 收盘筛选 · K < 10 共 {len(hits)} 只",
+            "",
+        ]
+        for h in hits:
+            pct = h.get("pct")
+            pct_s = f"{pct:+.2f}%" if pct is not None else "-"
+            lines.append(
+                f"{h['code']} {h['name']}  "
+                f"K={h['K']}  D={h['D']}  "
+                f"{h.get('px')}  {pct_s}"
+            )
+        lines += [
+            "",
+            f"全市场 K 中位 {summary.get('k_p50')} · "
+            f"K<20 有 {summary.get('below_20')} 只 · "
+            f"用时 {summary.get('elapsed_sec')}s",
+        ]
+        text = "\n".join(lines)
+
+    body = json.dumps(
+        {"msg_type": "text", "content": {"text": text}},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        webhook,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            print(f"飞书推送状态 {resp.status}", flush=True)
+    except Exception as e:
+        print(f"飞书推送失败: {e}", flush=True)
+
+
 def main():
     today = datetime.now(SH_TZ).strftime("%Y-%m-%d")
     today_compact = today.replace("-", "")
@@ -194,7 +254,7 @@ def main():
             "name": (row.get("name") or "").replace(" ", ""),
         }
     symbols = sorted(universe)
-    sh_n = sum(code.startswith("6") for code in (universe[s]["code"] for s in symbols))
+    sh_n = sum(1 for s in symbols if universe[s]["code"].startswith("6"))
     sz_n = len(symbols) - sh_n
     print(f"main {len(symbols)} sh {sh_n} sz {sz_n}", flush=True)
     if sh_n < 1600 or sz_n < 1400:
@@ -214,9 +274,11 @@ def main():
                 series[sym] = rows
             if done % 400 == 0 or done == len(symbols):
                 print(
-                    f"qfq {done}/{len(symbols)} ok={len(series)} err={len(errors)} t={time.time()-t0:.0f}s",
+                    f"qfq {done}/{len(symbols)} ok={len(series)} err={len(errors)} "
+                    f"t={time.time()-t0:.0f}s",
                     flush=True,
                 )
+
     if errors:
         retry = list(errors)
         print(f"retry {len(retry)}", flush=True)
@@ -237,6 +299,7 @@ def main():
     quotes = fetch_quotes(list(series))
     fresh = sum(1 for q in quotes.values() if q["ts"].startswith(today_compact))
     print(f"quotes {len(quotes)} dated_today {fresh}", flush=True)
+
     if len(quotes) >= 500 and fresh < len(quotes) * 0.5:
         print("今天不是交易日，或收盘行情还没更新。不覆盖上次结果。", flush=True)
         write_status("skip")
@@ -259,6 +322,7 @@ def main():
         ):
             closes.append(closes[-1] * (q["px"] / q["prev"]))
             dates.append(today)
+
         k, d, rsi = stochrsi(closes)
         if np.isnan(k[-1]):
             continue
@@ -314,10 +378,15 @@ def main():
         f.write("代码,名称,K,D,RSI,最新价,涨跌幅%,日期\n")
         for h in hits:
             f.write(
-                f"{h['code']},{h['name']},{h['K']},{h['D']},{h['rsi']},{h['px']},{h['pct']},{h['date']}\n"
+                f"{h['code']},{h['name']},{h['K']},{h['D']},{h['rsi']},"
+                f"{h['px']},{h['pct']},{h['date']}\n"
             )
     with open(OUT_JSON, "w", encoding="utf-8") as f:
         json.dump({"summary": summary, "hits": hits}, f, ensure_ascii=False, indent=2)
+
+    # 推送到飞书
+    push_feishu(hits, summary)
+
     write_status("ok")
     print(f"wrote {OUT_CSV} hits={len(hits)}", flush=True)
 
