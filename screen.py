@@ -5,14 +5,16 @@ RSI 周期 15（Wilder）
 STOCH 周期 8
 K = 原始值的 10 日简单移动平均
 D = K 的 3 日简单移动平均
-去掉 ST。K < 10 推送到飞书。
+去掉 ST，再去掉最新报告期亏损股（归母净利润或扣非净利润 ≤ 0）。
+K < 10 的结果按扣非净利润从高到低排序，推送到飞书。
 """
 import json
 import os
 import re
 import sys
 import time
-import urllib.request
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -41,8 +43,8 @@ def write_status(state):
 
 
 def http_get(url, timeout=18):
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    req = Request(url, headers=UA)
+    with urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
 
@@ -58,7 +60,6 @@ def simple_sma(x, period):
 
 
 def wilder_rsi(closes, n):
-    """Wilder RSI。前 n 根涨跌先做简单平均，之后按 (n-1)/n 递推。"""
     closes = np.asarray(closes, dtype=float)
     rsi = np.full(closes.shape, np.nan)
     if len(closes) <= n:
@@ -195,6 +196,36 @@ def fetch_quotes(symbols):
     return out
 
 
+def fetch_latest_profit(code):
+    """最新报告期归母净利润、扣非净利润，单位元。"""
+    suffix = "SH" if code.startswith("6") else "SZ"
+    filt = f'(SECUCODE="{code}.{suffix}")'
+    url = (
+        "https://datacenter.eastmoney.com/securities/api/data/get"
+        "?type=RPT_F10_FINANCE_MAINFINADATA"
+        "&sty=REPORT_DATE_NAME,KCFJCXSYJLR,PARENTNETPROFIT"
+        f"&filter={quote(filt)}&p=1&ps=1&sr=-1&st=REPORT_DATE"
+    )
+    req = Request(
+        url,
+        headers={
+            "User-Agent": UA["User-Agent"],
+            "Referer": "https://data.eastmoney.com/",
+        },
+    )
+    with urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    rows = (data.get("result") or {}).get("data") or []
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "kcf": row.get("KCFJCXSYJLR"),
+        "parent": row.get("PARENTNETPROFIT"),
+        "report": row.get("REPORT_DATE_NAME") or "",
+    }
+
+
 def push_feishu(hits, summary):
     webhook = os.environ.get("FEISHU_WEBHOOK", "").strip()
     if not webhook:
@@ -204,38 +235,44 @@ def push_feishu(hits, summary):
     if not hits:
         text = (
             f"【StochRSI】{date} 收盘筛选完成\n"
-            f"主板去ST 计算 {summary.get('computed')} 只，K < 10：0 只\n"
-            f"K 中位数 {summary.get('k_p50')}，最高 {summary.get('k_max')}"
+            f"主板去ST、去亏损后 K < 10：0 只\n"
+            f"K 中位数 {summary.get('k_p50')}"
         )
     else:
         lines = [
-            f"【StochRSI】{date} 收盘筛选 · 主板去ST · K < 10 共 {len(hits)} 只",
+            f"【StochRSI】{date} · 主板去ST · K<10且扣非盈利 · "
+            f"按扣非净利润从高到低 共 {len(hits)} 只",
             "",
         ]
-        for h in hits:
+        show = hits[:40]
+        for h in show:
             pct = h.get("pct")
             pct_s = f"{pct:+.2f}%" if pct is not None else "-"
+            yi = h["kcf"] / 1e8
             lines.append(
-                f"{h['code']} {h['name']}  K={h['K']}  D={h['D']}  {h.get('px')}  {pct_s}"
+                f"{h['code']} {h['name']}  扣非{yi:.2f}亿({h['report']})  "
+                f"K={h['K']}  D={h['D']}  {h.get('px')}  {pct_s}"
             )
+        if len(hits) > len(show):
+            lines.append(f"... 其余 {len(hits) - len(show)} 只见 out/latest.csv")
         lines += [
             "",
-            f"K 中位 {summary.get('k_p50')} · K<20 有 {summary.get('below_20')} 只 · "
-            f"用时 {summary.get('elapsed_sec')}s",
+            f"K<10 共 {summary.get('k_below_10')} 只，亏损或无财报剔除 "
+            f"{summary.get('dropped_loss')} 只 · 用时 {summary.get('elapsed_sec')}s",
         ]
         text = "\n".join(lines)
     body = json.dumps(
         {"msg_type": "text", "content": {"text": text}},
         ensure_ascii=False,
     ).encode("utf-8")
-    req = urllib.request.Request(
+    req = Request(
         webhook,
         data=body,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urlopen(req, timeout=15) as resp:
             print(f"飞书推送状态 {resp.status}", flush=True)
     except Exception as e:
         print(f"飞书推送失败: {e}", flush=True)
@@ -361,7 +398,36 @@ def main():
         write_status("skip")
         return
 
-    hits.sort(key=lambda row: (row["K"], row["code"]))
+    k_below_10 = len(hits)
+    print(f"fetch profit for {k_below_10} hits...", flush=True)
+    profits = {}
+    with ThreadPoolExecutor(8) as ex:
+        futs = {ex.submit(fetch_latest_profit, h["code"]): h["code"] for h in hits}
+        for fut in as_completed(futs):
+            code = futs[fut]
+            try:
+                profits[code] = fut.result()
+            except Exception as e:
+                profits[code] = None
+                print(f"profit {code} failed: {e}", flush=True)
+
+    kept = []
+    dropped_loss = 0
+    for h in hits:
+        info = profits.get(h["code"])
+        kcf = None if not info else info.get("kcf")
+        parent = None if not info else info.get("parent")
+        if kcf is None or parent is None or kcf <= 0 or parent <= 0:
+            dropped_loss += 1
+            continue
+        h["kcf"] = float(kcf)
+        h["parent_np"] = float(parent)
+        h["report"] = info["report"]
+        kept.append(h)
+    hits = kept
+    hits.sort(key=lambda row: (-row["kcf"], row["code"]))
+    print(f"after profit filter {len(hits)} dropped {dropped_loss}", flush=True)
+
     arr = np.asarray(ks, dtype=float)
     summary = {
         "date": today,
@@ -371,6 +437,8 @@ def main():
         "errors": len(errors),
         "error_sample": list(errors.items())[:8],
         "st_skipped": st_skipped,
+        "k_below_10": k_below_10,
+        "dropped_loss": dropped_loss,
         "below_10": len(hits),
         "below_20": int((arr < 20).sum()),
         "above_80": int((arr > 80).sum()),
@@ -384,10 +452,11 @@ def main():
 
     os.makedirs("out", exist_ok=True)
     with open(OUT_CSV, "w", encoding="utf-8-sig") as f:
-        f.write("代码,名称,K,D,RSI,最新价,涨跌幅%,日期\n")
+        f.write("代码,名称,扣非净利润元,归母净利润元,报告期,K,D,RSI,最新价,涨跌幅%,日期\n")
         for h in hits:
             f.write(
-                f"{h['code']},{h['name']},{h['K']},{h['D']},{h['rsi']},{h['px']},{h['pct']},{h['date']}\n"
+                f"{h['code']},{h['name']},{h['kcf']:.2f},{h['parent_np']:.2f},{h['report']},"
+                f"{h['K']},{h['D']},{h['rsi']},{h['px']},{h['pct']},{h['date']}\n"
             )
     with open(OUT_JSON, "w", encoding="utf-8") as f:
         json.dump({"summary": summary, "hits": hits}, f, ensure_ascii=False, indent=2)
